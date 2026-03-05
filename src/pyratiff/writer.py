@@ -19,6 +19,19 @@ _TQDM_FORMAT = (
     " [{elapsed}<{remaining}, {rate_fmt}]"
 )
 
+_VALID_IMAGE_DTYPES = {
+    np.dtype("uint8"),
+    np.dtype("uint16"),
+    np.dtype("uint32"),
+    np.dtype("float32"),
+    np.dtype("float64"),
+}
+_VALID_MASK_DTYPES = {
+    np.dtype("uint8"),
+    np.dtype("uint16"),
+    np.dtype("uint32"),
+}
+
 
 class PyramidWriter:
     """Assemble a multi-channel pyramidal OME-TIFF from arrays or files.
@@ -282,7 +295,9 @@ class PyramidWriter:
         target_shape : tuple[int, int]
             Expected ``(H, W)``.
         is_mask : bool
-            When ``True``, ``uint32`` and ``int32`` are allowed.
+            When ``True``, only unsigned integer dtypes are accepted
+            (uint8, uint16, uint32). When ``False``, uint8, uint16, uint32,
+            float32, and float64 are accepted.
         msg_tag : str
             Prefix for error messages.
 
@@ -292,17 +307,13 @@ class PyramidWriter:
             On dtype or shape mismatch.
         """
         prefix = f"{msg_tag}: " if msg_tag else ""
-        if dtype in (np.dtype("uint32"), np.dtype("int32")):
-            if not is_mask:
+        if is_mask:
+            if dtype not in _VALID_MASK_DTYPES:
                 raise ValueError(
-                    f"{prefix}32-bit dtype is only supported with is_mask=True"
+                    f"{prefix}Mask dtype must be unsigned integer "
+                    f"(uint8/uint16/uint32), got {dtype}"
                 )
-        elif dtype not in (
-            np.dtype("uint8"),
-            np.dtype("uint16"),
-            np.dtype("float32"),
-            np.dtype("float64"),
-        ):
+        elif dtype not in _VALID_IMAGE_DTYPES:
             raise ValueError(f"{prefix}Unsupported dtype: {dtype}")
         if shape != target_shape:
             raise ValueError(

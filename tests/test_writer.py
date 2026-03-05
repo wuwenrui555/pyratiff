@@ -15,20 +15,20 @@ from pyratiff import PyramidWriter
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32, np.float64])
-def test_validate_ok_dtypes(dtype):
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.uint32, np.float32, np.float64])
+def test_validate_ok_image_dtypes(dtype):
     PyramidWriter._validate_image_2d((64, 64), np.dtype(dtype), (64, 64), False)
 
 
-@pytest.mark.parametrize("dtype", [np.uint32, np.int32])
-def test_validate_32bit_requires_mask(dtype):
-    with pytest.raises(ValueError, match="32-bit"):
-        PyramidWriter._validate_image_2d((64, 64), np.dtype(dtype), (64, 64), False)
-
-
-@pytest.mark.parametrize("dtype", [np.uint32, np.int32])
-def test_validate_32bit_ok_with_mask(dtype):
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.uint32])
+def test_validate_ok_mask_dtypes(dtype):
     PyramidWriter._validate_image_2d((64, 64), np.dtype(dtype), (64, 64), True)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+def test_validate_float_and_signed_rejected_as_mask(dtype):
+    with pytest.raises(ValueError, match="Mask dtype must be unsigned integer"):
+        PyramidWriter._validate_image_2d((64, 64), np.dtype(dtype), (64, 64), True)
 
 
 def test_validate_unsupported_dtype():
