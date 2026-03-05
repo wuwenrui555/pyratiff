@@ -1,6 +1,6 @@
 [project]
 name = "pyratiff"
-version = "0.1.0"
+version = "1.0.0"
 description = "Read and write pyramidal OME-TIFF files"
 readme = "README.md"
 authors = [
@@ -14,6 +14,7 @@ dependencies = [
     "scikit-image>=0.19",
     "pandas>=1.5",
     "tqdm>=4.0",
+    "imagecodecs",
 ]
 
 [build-system]
@@ -22,3 +23,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyratiff"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
