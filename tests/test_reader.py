@@ -153,3 +153,52 @@ def test_slice_array_values(ome_tiff_3ch):
     result = reader.slice_array(0, 10, 0, 10)
     expected = tifffile.imread(str(ome_tiff_3ch), level=0)[:, :10, :10]
     np.testing.assert_array_equal(result, expected)
+
+
+# ---------------------------------------------------------------------------
+# _deduplicate_names
+# ---------------------------------------------------------------------------
+
+
+def test_deduplicate_names_no_duplicates():
+    assert TiffZarrReader._deduplicate_names(["A", "B", "C"]) == ["A", "B", "C"]
+
+
+def test_deduplicate_names_with_duplicates():
+    result = TiffZarrReader._deduplicate_names(["DAPI", "CD45", "DAPI"])
+    assert result == ["DAPI_0", "CD45", "DAPI_1"]
+
+
+def test_deduplicate_names_all_same():
+    result = TiffZarrReader._deduplicate_names(["X", "X", "X"])
+    assert result == ["X_0", "X_1", "X_2"]
+
+
+def test_deduplicate_names_multiple_groups():
+    result = TiffZarrReader._deduplicate_names(["A", "B", "A", "B", "C"])
+    assert result == ["A_0", "B_0", "A_1", "B_1", "C"]
+
+
+def test_init_dedup_applied_to_channel_names(tmp_path):
+    """Duplicate channel names in __init__ get suffixes in self.channel_names."""
+    import tifffile
+
+    path = tmp_path / "dup.tiff"
+    data = np.zeros((3, 64, 64), dtype=np.uint16)
+    tifffile.imwrite(str(path), data, photometric="minisblack")
+
+    reader = TiffZarrReader(path, channel_names=["DAPI", "CD45", "DAPI"])
+    assert reader.channel_names == ["DAPI_0", "CD45", "DAPI_1"]
+
+
+def test_init_dedup_zimg_dict_has_all_channels(tmp_path):
+    """zimg_dict must contain entries for all channels after deduplication."""
+    import tifffile
+
+    path = tmp_path / "dup.tiff"
+    data = np.zeros((3, 64, 64), dtype=np.uint16)
+    tifffile.imwrite(str(path), data, photometric="minisblack")
+
+    reader = TiffZarrReader(path, channel_names=["DAPI", "CD45", "DAPI"])
+    assert set(reader.zimg_dict.keys()) == {"DAPI_0", "CD45", "DAPI_1"}
+    assert len(reader.zimg_dict) == 3
