@@ -297,7 +297,12 @@ class PyramidWriter:
                 raise ValueError(
                     f"{prefix}32-bit dtype is only supported with is_mask=True"
                 )
-        elif dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+        elif dtype not in (
+            np.dtype("uint8"),
+            np.dtype("uint16"),
+            np.dtype("float32"),
+            np.dtype("float64"),
+        ):
             raise ValueError(f"{prefix}Unsupported dtype: {dtype}")
         if shape != target_shape:
             raise ValueError(
@@ -392,9 +397,10 @@ class PyramidWriter:
                         t = zimg[c, ts * j : ts * (j + 1), ts * i : ts * (i + 1)]
                     if is_mask:
                         return t[::2, ::2].astype(target_dtype)
-                    return np.round(
-                        skimage.transform.downscale_local_mean(t, (2, 2))
-                    ).astype(target_dtype)
+                    downsampled = skimage.transform.downscale_local_mean(t, (2, 2))
+                    if np.issubdtype(target_dtype, np.floating):
+                        return downsampled.astype(target_dtype)
+                    return np.round(downsampled).astype(target_dtype)
 
                 ch, cw = cshapes[level]
                 coords = itertools.product(range(num_channels), range(ch), range(cw))
