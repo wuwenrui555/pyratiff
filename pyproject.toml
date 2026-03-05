@@ -14,6 +14,7 @@ dependencies = [
     "scikit-image>=0.19",
     "pandas>=1.5",
     "tqdm>=4.0",
+    "imagecodecs",
 ]
 
 [build-system]

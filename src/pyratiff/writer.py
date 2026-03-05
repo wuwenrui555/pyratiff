@@ -484,9 +484,6 @@ class PyramidWriter:
             num_threads=num_threads,
         )
 
-        # Floating-point predictor requires imagecodecs; use predictor only for ints.
-        use_predictor = not np.issubdtype(self.target_dtype, np.floating)
-
         total_tiles = sum(cs[0] * cs[1] for cs in cshapes)
         pbar = tqdm(total=total_tiles, desc="Writing tiles", bar_format=_TQDM_FORMAT)
 
@@ -500,7 +497,7 @@ class PyramidWriter:
                         dtype=self.target_dtype,
                         tile=(tile_size, tile_size),
                         compression="adobe_deflate",
-                        predictor=use_predictor,
+                        predictor=True,
                         metadata=metadata,
                     )
                 else:
@@ -511,7 +508,7 @@ class PyramidWriter:
                         dtype=self.target_dtype,
                         tile=(tile_size, tile_size),
                         compression="adobe_deflate",
-                        predictor=use_predictor,
+                        predictor=True,
                     )
                 pbar.update(cshapes[level][0] * cshapes[level][1])
 
