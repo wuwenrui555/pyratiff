@@ -15,7 +15,7 @@ from pyratiff import PyramidWriter
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32, np.float64])
 def test_validate_ok_dtypes(dtype):
     PyramidWriter._validate_image_2d((64, 64), np.dtype(dtype), (64, 64), False)
 
@@ -33,7 +33,7 @@ def test_validate_32bit_ok_with_mask(dtype):
 
 def test_validate_unsupported_dtype():
     with pytest.raises(ValueError, match="Unsupported dtype"):
-        PyramidWriter._validate_image_2d((64, 64), np.dtype(np.float32), (64, 64), False)
+        PyramidWriter._validate_image_2d((64, 64), np.dtype(np.int16), (64, 64), False)
 
 
 def test_validate_shape_mismatch():
@@ -288,3 +288,28 @@ def test_export_pixel_values_preserved(tmp_path):
 
     result = tifffile.imread(str(out), level=0)
     np.testing.assert_array_equal(result, data)
+
+
+# ---------------------------------------------------------------------------
+# float dtype support
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_from_array_float(dtype):
+    data = np.random.rand(2, 64, 64).astype(dtype)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    assert writer.target_dtype == np.dtype(dtype)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_export_float_roundtrip(tmp_path, dtype):
+    """Float images write and read back without dtype change."""
+    out = tmp_path / "float.ome.tiff"
+    data = np.random.rand(2, 64, 64).astype(dtype)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ometiff_pyramid(out)
+
+    result = tifffile.imread(str(out), level=0)
+    assert result.dtype == np.dtype(dtype)
+    np.testing.assert_allclose(result, data, rtol=1e-5)
