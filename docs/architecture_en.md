@@ -57,11 +57,25 @@ tifffile ≥ 2025.5.21 requires zarr ≥ 3. Key differences from zarr 2:
 - `zarr.open(store, mode="r")` — `mode` must be explicit.
 - `zarr_array.astype(dtype)` — removed; use `np.asarray(arr).astype(dtype)`.
 
+### Duplicate channel name deduplication
+
+If the supplied `channel_names` contain duplicates, `_deduplicate_names`
+adds `_0`, `_1`, … suffixes to **all occurrences** of every repeated name
+before `zimg_dict` is built. This prevents silent key collision in the dict.
+
+```python
+["DAPI", "CD45", "DAPI"]  →  ["DAPI_0", "CD45", "DAPI_1"]
+```
+
+Unique names are returned unchanged. Deduplication always runs in `__init__`
+after the length check, so `self.channel_names` and `zimg_dict` are always
+consistent.
+
 ### Key attributes
 
 ```
 reader.zimg          zarr.Array, shape (C, H, W) or (H, W)
-reader.channel_names list[str], one entry per channel
+reader.channel_names list[str], one entry per channel (deduplicated)
 reader.zimg_dict     dict[str, zarr.Array], each (H, W)
 ```
 
@@ -122,6 +136,8 @@ individual channels named `<base>_0`, `<base>_1`, …
 |---|---|---|
 | uint8 | ✓ | ✓ |
 | uint16 | ✓ | ✓ |
+| float32 | ✓ | ✓ |
+| float64 | ✓ | ✓ |
 | uint32 / int32 | ✗ | ✓ |
 | other | ✗ | ✗ |
 
@@ -145,8 +161,13 @@ Two generator functions are created by `_make_tile_generators`:
 
 **`tiles(level)`** — opens the partially-written output file, reads tiles
 from `level - 1` via zarr, downsamples by 2× using a thread pool, and
-yields the results. For regular images, `skimage.transform.downscale_local_mean`
-is used; for masks, strided indexing `[::2, ::2]` is used instead.
+yields the results. Downsampling strategy:
+
+- **Regular images** — `skimage.transform.downscale_local_mean`, then
+  `np.round().astype(dtype)` for integer dtypes, or `.astype(dtype)` for
+  float dtypes (rounding is skipped to preserve precision).
+- **Masks** (`is_mask=True`) — strided indexing `[::2, ::2]` to preserve
+  integer label values without interpolation.
 
 ### OME-XML metadata
 
@@ -162,6 +183,15 @@ Written via tifffile's `metadata` dict:
 ```
 
 `pixel_size` and `channel_names` are omitted when `None` / empty.
+
+### Compression and predictor
+
+All levels use `compression="adobe_deflate"` with `predictor=True`.
+tifffile selects the appropriate predictor automatically:
+
+- Integer dtypes → horizontal differencing predictor (built into tifffile)
+- Float dtypes → floating-point predictor (PREDICTOR type 3, requires
+  `imagecodecs`)
 
 ### Threading
 
@@ -197,3 +227,4 @@ TIFF strip, which is required by the OME-TIFF pyramid specification.
 | scikit-image | 0.19 | `downscale_local_mean` |
 | pandas | 1.5 | metadata parsing |
 | tqdm | 4.0 | progress bars |
+| imagecodecs | — | floating-point predictor for float32/float64 TIFF |
