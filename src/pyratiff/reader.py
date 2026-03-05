@@ -79,7 +79,7 @@ class TiffZarrReader:
             raise ValueError(
                 f"channel_names: Expected {n_channel} channel names, got {len(channel_names)}"
             )
-        self.channel_names = channel_names
+        self.channel_names = self._deduplicate_names(channel_names)
 
         self.zimg_dict = {
             channel_name: zarr.open(
@@ -301,3 +301,43 @@ class TiffZarrReader:
             name: np.asarray(self.zimg_dict[name][ymin:ymax, xmin:xmax])
             for name in self.channel_names
         }
+
+    @staticmethod
+    def _deduplicate_names(names: list[str]) -> list[str]:
+        """Add ``_0``, ``_1``, … suffixes to all occurrences of any duplicate name.
+
+        Parameters
+        ----------
+        names : list[str]
+            Original channel names, possibly containing duplicates.
+
+        Returns
+        -------
+        list[str]
+            Names with suffixes added to every occurrence of a repeated name.
+            Unique names are returned unchanged.
+
+        Examples
+        --------
+        >>> TiffZarrReader._deduplicate_names(["DAPI", "CD45", "DAPI"])
+        ['DAPI_0', 'CD45', 'DAPI_1']
+        >>> TiffZarrReader._deduplicate_names(["A", "B", "C"])
+        ['A', 'B', 'C']
+        """
+        from collections import Counter
+
+        counts = Counter(names)
+        duplicates = {name for name, count in counts.items() if count > 1}
+        if not duplicates:
+            return list(names)
+
+        seen: dict[str, int] = {}
+        result = []
+        for name in names:
+            if name in duplicates:
+                idx = seen.get(name, 0)
+                result.append(f"{name}_{idx}")
+                seen[name] = idx + 1
+            else:
+                result.append(name)
+        return result
