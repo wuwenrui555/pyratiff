@@ -232,13 +232,15 @@ class PyramidWriter:
                 f"channel_names: Expected {len(input_data)} names, got {len(channel_names)}"
             )
 
-        target_shape = next(iter(input_data.values())).shape[-2:]
         in_imgs: list[np.ndarray] = []
         in_chns: list[str] = []
+        target_shape: tuple[int, int] | None = None
         for name, img_in in zip(channel_names, input_data.values()):
             if not isinstance(img_in, (np.ndarray, zarr.Array)):
                 raise ValueError(f"{name}: Unsupported type {type(img_in)}")
             img_in = np.asarray(img_in)
+            if target_shape is None:
+                target_shape = img_in.shape[-2:]
             if img_in.ndim == 2:
                 cls._validate_image_2d(img_in.shape, img_in.dtype, target_shape, is_mask, name)
                 in_imgs.append(img_in)
