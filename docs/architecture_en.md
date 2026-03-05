@@ -136,10 +136,10 @@ individual channels named `<base>_0`, `<base>_1`, …
 |---|---|---|
 | uint8 | ✓ | ✓ |
 | uint16 | ✓ | ✓ |
-| float32 | ✓ | ✓ |
-| float64 | ✓ | ✓ |
-| uint32 / int32 | ✗ | ✓ |
-| other | ✗ | ✗ |
+| uint32 | ✓ | ✓ |
+| float32 | ✓ | ✗ |
+| float64 | ✓ | ✗ |
+| int32 and other signed | ✗ | ✗ |
 
 All channels are cast to the maximum dtype among the inputs before writing.
 

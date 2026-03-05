@@ -125,9 +125,9 @@ writer.export_ometiff_pyramid("mask.ome.tiff", is_mask=True)
 |---|---|---|
 | uint8 | ✓ | ✓ |
 | uint16 | ✓ | ✓ |
-| float32 | ✓ | ✓ |
-| float64 | ✓ | ✓ |
-| uint32 / int32 | ✗ | ✓ |
+| uint32 | ✓ | ✓ |
+| float32 | ✓ | ✗ |
+| float64 | ✓ | ✗ |
 
 `export_ometiff_pyramid(output_f, pixel_size=None, tile_size=256, is_mask=False, num_threads=8, overwrite=True)`
 
