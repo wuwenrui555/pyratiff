@@ -3,6 +3,7 @@ name = "pyratiff"
 version = "1.0.0"
 description = "Read and write pyramidal OME-TIFF files"
 readme = "README.md"
+license = "Apache-2.0"
 authors = [
     { name = "wuwenrui555", email = "wuwenruiwwr@outlook.com" }
 ]
