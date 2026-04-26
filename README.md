@@ -134,3 +134,7 @@ writer.export_ometiff_pyramid("mask.ome.tiff", is_mask=True)
 ## Documentation
 
 See [`docs/architecture_en.md`](docs/architecture_en.md) for internal design details.
+
+## License
+
+Apache-2.0
