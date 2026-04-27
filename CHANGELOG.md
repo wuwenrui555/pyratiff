@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.0.1] - 2026-04-26
+
+### Changed
+
+- **Richer omero metadata in OME-Zarr output.** The `omero` block now
+  includes per-channel `color`, `active`, and `window` (alongside the
+  existing `label`), plus omero-level `name`, `version`, and `rdefs`.
+  napari-ome-zarr (and OMERO / IDR / IJ Bio-Formats) read these to render
+  each channel as a separate Image layer with a sensible colormap and
+  contrast — without them, viewers fall back to a single layer with a
+  channel slider.
+- Default channel colors cycle through a 7-color palette
+  (white, red, green, blue, yellow, magenta, cyan); first channel is white
+  (nucleus-friendly).
+- Default `window` is the dtype's full range (`iinfo.min`..`iinfo.max` for
+  ints, `0.0..1.0` for floats); viewers can auto-contrast on top of this.
+
+### Why
+
+Even though the v2.0.0 omero block was a valid (minimal) OME-NGFF v0.4
+document, napari-ome-zarr needs more fields to render channels well.
+
 ## [2.0.0] - 2026-04-26
 
 OME-Zarr is now the canonical pyramid format; OME-TIFF is derived from it.

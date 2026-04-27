@@ -49,6 +49,33 @@ _VALID_MASK_DTYPES = {
     np.dtype("uint32"),
 }
 
+# Default channel colors used in the omero metadata block. napari-ome-zarr
+# reads these to assign per-channel colormaps; ImageJ Bio-Formats and other
+# OME tools also honor them. Order: white (nucleus-friendly), then RGB +
+# secondary colors. Cycles past 7.
+_DEFAULT_CHANNEL_COLORS = [
+    "FFFFFF",  # white
+    "FF0000",  # red
+    "00FF00",  # green
+    "0000FF",  # blue
+    "FFFF00",  # yellow
+    "FF00FF",  # magenta
+    "00FFFF",  # cyan
+]
+
+
+def _channel_window(dtype: np.dtype) -> dict:
+    """Default OME-NGFF omero ``window`` block for a given dtype."""
+    if np.issubdtype(dtype, np.floating):
+        return {"min": 0.0, "max": 1.0, "start": 0.0, "end": 1.0}
+    info = np.iinfo(dtype)
+    return {
+        "min": int(info.min),
+        "max": int(info.max),
+        "start": int(info.min),
+        "end": int(info.max),
+    }
+
 
 class _ChannelView:
     """Lazy 2-D view of one channel of a 3-D ``(C, H, W)`` zarr-like array.
@@ -445,8 +472,26 @@ class PyramidWriter:
             "datasets": datasets,
             "type": "nearest" if is_mask else "mean",
         }]
+
+        # omero block: napari-ome-zarr / IDR / OMERO read color, window,
+        # active per channel. With these set, napari opens each channel as a
+        # separate Image layer with a sensible colormap; without them, napari
+        # falls back to a single layer with a channel slider.
+        window = _channel_window(self.target_dtype)
+        omero_channels = []
+        for i, name_i in enumerate(self.in_chns):
+            color = _DEFAULT_CHANNEL_COLORS[i % len(_DEFAULT_CHANNEL_COLORS)]
+            omero_channels.append({
+                "label": name_i,
+                "color": color,
+                "active": True,
+                "window": dict(window),
+            })
         root.attrs["omero"] = {
-            "channels": [{"label": n} for n in self.in_chns],
+            "name": name,
+            "version": "0.4",
+            "channels": omero_channels,
+            "rdefs": {"defaultT": 0, "defaultZ": 0, "model": "color"},
         }
 
     # ------------------------------------------------------------------
