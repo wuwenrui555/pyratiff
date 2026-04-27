@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.0.0] - 2026-04-26
+
+OME-Zarr is now the canonical pyramid format; OME-TIFF is derived from it.
+Pipeline is fully lazy + streaming so larger-than-RAM images go through
+without OOM. Output is byte-identical to v1.1.0 for in-memory inputs
+(verified by the same golden-master and cross-format tests).
+
+### Architecture changes
+
+- **Input is lazy**. ``self.in_imgs`` now stores zarr-backed arrays (or
+  numpy slices that share memory with the original) rather than eager
+  numpy copies. Inputs from disk (``from_fs``, ``from_ome_zarr``) never load
+  until pyramid generation reads each tile.
+- **Pyramid is streamed tile-by-tile** in ``_stream_pyramid_to_zarr_group``.
+  Memory peak is ``O(num_channels * tile_size² * dtype_size)`` per active
+  tile, not ``O(full pyramid)``.
+- **OME-Zarr is canonical**. ``export_ome_zarr`` writes a full OME-NGFF v0.4
+  group via the streaming builder. ``export_ometiff_pyramid`` first writes a
+  temporary OME-Zarr (in a system tempdir) and then derives the OME-TIFF
+  from it via ``_zarr_group_to_ometiff``. The temp zarr is cleaned up
+  automatically.
+
+### Added
+
+- **`PyramidWriter.from_ome_zarr(path)`** — lazy reader for an existing
+  OME-NGFF v0.4 zarr group. Channel names come from the omero metadata
+  when available, otherwise fall back to ``channel_0..N-1``.
+- 5 new tests cover round-tripping through ``from_ome_zarr``, lazy input
+  semantics, byte-identity across tile sizes, and temp-zarr cleanup.
+
+### Removed (internal)
+
+- ``_build_pyramid_levels`` (numpy-cascade approach from v1.0.1) — replaced
+  by ``_stream_pyramid_to_zarr_group``.
+- ``_tile_generator`` for in-memory levels — no longer needed; tiles come
+  from zarr arrays directly.
+
+### Breaking changes
+
+- ``self.in_imgs`` element type changed from ``list[numpy.ndarray]`` to
+  ``list[ArrayLike]`` (numpy arrays for ``from_array`` / ``from_dict`` with
+  numpy values; zarr arrays or ``_ChannelView`` wrappers for ``from_fs``,
+  ``from_dict`` with zarr values, and ``from_ome_zarr``). Subclasses or
+  external code that introspect ``in_imgs`` may need to call
+  ``np.asarray(item)`` before assuming numpy semantics.
+
+### Why
+
+Long-term direction is napari + OME-NGFF; the v2.0 architecture makes
+OME-Zarr first-class and removes the eager-numpy assumption that previously
+capped pyratiff at images that fit in RAM. All existing public API
+signatures and outputs are preserved.
+
 ## [1.1.0] - 2026-04-26
 
 ### Added

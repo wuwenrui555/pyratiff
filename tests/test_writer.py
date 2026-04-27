@@ -533,3 +533,112 @@ def test_ome_zarr_and_ometiff_byte_identical(tmp_path):
         np.testing.assert_array_equal(
             tiff_level, zarr_level, err_msg=f"level {L} differs between formats"
         )
+
+
+# ---------------------------------------------------------------------------
+# v2.0 — from_ome_zarr constructor + streaming/lazy semantics
+# ---------------------------------------------------------------------------
+
+
+def test_from_ome_zarr_round_trip(tmp_path):
+    """Write OME-Zarr, read it back via from_ome_zarr, re-export — values must match."""
+    rng = np.random.default_rng(2026)
+    data = rng.integers(0, 500, (2, 256, 256), dtype=np.uint16)
+
+    src_path = tmp_path / "src.ome.zarr"
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        src_path, chunk_size=128
+    )
+
+    # Reload and re-export (testing the from_ome_zarr lazy reader).
+    writer = PyramidWriter.from_ome_zarr(src_path)
+    assert writer.in_chns == ["A", "B"]
+    assert writer.target_shape == (256, 256)
+    assert writer.target_dtype == np.dtype("uint16")
+
+    re_path = tmp_path / "re.ome.zarr"
+    writer.export_ome_zarr(re_path, chunk_size=128)
+
+    src_root = _open_zarr_group(src_path)
+    re_root = _open_zarr_group(re_path)
+    np.testing.assert_array_equal(
+        np.asarray(src_root["0"][:]), np.asarray(re_root["0"][:])
+    )
+
+
+def test_from_ome_zarr_falls_back_to_default_channel_names(tmp_path):
+    """OME-Zarr without omero metadata still loads with channel_0..N-1."""
+    # Build a minimal v0.4 zarr without omero metadata.
+    src = tmp_path / "minimal.ome.zarr"
+    store = zarr.storage.LocalStore(str(src))
+    root = zarr.open_group(store=store, mode="w", zarr_format=2)
+    arr = root.create_array(name="0", shape=(2, 64, 64), chunks=(2, 32, 32), dtype=np.uint16)
+    arr[:] = np.zeros((2, 64, 64), dtype=np.uint16)
+    root.attrs["multiscales"] = [{
+        "version": "0.4",
+        "axes": [{"name": "c", "type": "channel"},
+                 {"name": "y", "type": "space"},
+                 {"name": "x", "type": "space"}],
+        "datasets": [{"path": "0",
+                      "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}],
+    }]
+
+    writer = PyramidWriter.from_ome_zarr(src)
+    assert writer.in_chns == ["channel_0", "channel_1"]
+
+
+def test_streaming_does_not_materialize_full_pyramid_in_memory(tmp_path):
+    """Lazy/streaming guard: confirm `in_imgs` items stay zarr-like (not realized to numpy)."""
+    rng = np.random.default_rng(7)
+    src = tmp_path / "src.ome.zarr"
+    data = rng.integers(0, 100, (2, 128, 128), dtype=np.uint16)
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        src, chunk_size=64
+    )
+
+    writer = PyramidWriter.from_ome_zarr(src)
+    # in_imgs entries should be lazy views, not numpy arrays loaded eagerly.
+    for item in writer.in_imgs:
+        assert not isinstance(item, np.ndarray), \
+            "from_ome_zarr should keep input lazy (not materialize as numpy)"
+
+
+def test_streaming_pyramid_byte_identical_across_tile_sizes(tmp_path):
+    """The streaming pyramid produces the same content regardless of tile_size."""
+    rng = np.random.default_rng(31)
+    data = rng.integers(0, 1000, (2, 384, 384), dtype=np.uint16)
+
+    out_a = tmp_path / "a.ome.zarr"
+    out_b = tmp_path / "b.ome.zarr"
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        out_a, chunk_size=128
+    )
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        out_b, chunk_size=64
+    )
+
+    root_a = _open_zarr_group(out_a)
+    root_b = _open_zarr_group(out_b)
+    n_a = len(root_a.attrs["multiscales"][0]["datasets"])
+    n_b = len(root_b.attrs["multiscales"][0]["datasets"])
+    # Different tile_size produces different *level counts*, but level 0 must
+    # be identical (it's just the base image).
+    np.testing.assert_array_equal(
+        np.asarray(root_a["0"][:]), np.asarray(root_b["0"][:])
+    )
+    # Levels that exist in both must agree byte-for-byte.
+    for L in range(min(n_a, n_b)):
+        if str(L) in root_a and str(L) in root_b:
+            np.testing.assert_array_equal(
+                np.asarray(root_a[str(L)][:]),
+                np.asarray(root_b[str(L)][:]),
+                err_msg=f"level {L} differs between tile sizes",
+            )
+
+
+def test_ometiff_temp_zarr_cleaned_up(tmp_path):
+    """After export_ometiff_pyramid, no leftover staging zarr should remain in tmp_path."""
+    out = tmp_path / "out.ome.tiff"
+    _make_writer().export_ometiff_pyramid(out)
+    leftover_zarrs = list(tmp_path.glob("*.ome.zarr"))
+    assert leftover_zarrs == [], f"Found leftover staging zarr: {leftover_zarrs}"

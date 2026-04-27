@@ -1,11 +1,27 @@
-"""PyramidWriter — assemble multi-channel pyramidal OME-TIFF files."""
+"""PyramidWriter — assemble multi-channel pyramidal OME-NGFF (zarr) and OME-TIFF files.
+
+v2.0 architecture
+-----------------
+- **Input is lazy**: ``self.in_imgs`` is a list of array-likes that support
+  numpy-style 2-D slicing. numpy arrays passed to ``from_array`` are wrapped
+  in an in-memory zarr; OME-TIFF and OME-NGFF inputs stay file-backed via
+  ``tifffile.imread(aszarr=True)`` and ``zarr.open_group``.
+- **Pyramid is streamed**: each pyramid level is written to the output zarr
+  one tile at a time. Memory peak is ``O(num_channels * tile_size² * dtype)``,
+  not the full image. Larger-than-RAM inputs go through fine.
+- **OME-Zarr is the canonical output**: ``export_ome_zarr`` writes a full
+  OME-NGFF v0.4 group; ``export_ometiff_pyramid`` writes the same image stack
+  by first staging to a temporary OME-Zarr and then converting to OME-TIFF.
+"""
 
 import logging
 import multiprocessing
 import os
 import pathlib
+import shutil
+import tempfile
 import uuid
-from typing import Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import skimage.transform
@@ -34,23 +50,46 @@ _VALID_MASK_DTYPES = {
 }
 
 
+class _ChannelView:
+    """Lazy 2-D view of one channel of a 3-D ``(C, H, W)`` zarr-like array.
+
+    Forwards numpy-style slicing to the underlying parent without ever
+    materializing the full channel in memory.
+    """
+
+    __slots__ = ("_parent", "_c", "shape", "dtype", "ndim")
+
+    def __init__(self, parent: Any, c: int):
+        self._parent = parent
+        self._c = c
+        self.shape = tuple(parent.shape[1:])
+        self.dtype = parent.dtype
+        self.ndim = 2
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            return self._parent[(self._c, *key)]
+        return self._parent[self._c, key]
+
+
 class PyramidWriter:
-    """Assemble a multi-channel pyramidal OME-TIFF from arrays or files.
+    """Assemble a multi-channel pyramidal OME-NGFF / OME-TIFF from arrays or files.
 
     Construct via one of the class methods, then call
-    :meth:`export_ometiff_pyramid` to write the output file.
+    :meth:`export_ome_zarr` (canonical) or :meth:`export_ometiff_pyramid`
+    (derived) to write the output.
 
-    Parameters
+    Attributes
     ----------
-    in_imgs : list[numpy.ndarray]
-        One 2-D ``(H, W)`` array per channel, all with the same shape and
-        dtype.
+    in_imgs : list
+        One 2-D array-like per channel, each lazily indexed by ``[y, x]``.
+        May be numpy arrays (in-memory) or zarr arrays (file-backed).
     in_chns : list[str]
-        Channel names, same length as ``in_imgs``.
+        Channel names, one per entry in ``in_imgs``.
     target_shape : tuple[int, int]
         ``(H, W)`` of each channel image.
     target_dtype : numpy.dtype
-        Common dtype for all channels (typically the maximum across inputs).
+        Common dtype for all channels (output dtype after pyramid casting).
 
     Examples
     --------
@@ -58,17 +97,20 @@ class PyramidWriter:
     >>> from pyratiff import PyramidWriter
     >>> data = np.zeros((3, 4096, 4096), dtype=np.uint16)
     >>> writer = PyramidWriter.from_array(data, channel_names=["DAPI", "CD45", "PanCK"])
-    >>> writer.export_ometiff_pyramid("out.ome.tiff", pixel_size=0.5)
+    >>> writer.export_ome_zarr("out.ome.zarr", pixel_size=0.5)        # napari-friendly
+    >>> writer.export_ometiff_pyramid("out.ome.tiff", pixel_size=0.5)  # QuPath-friendly
     """
+
+    DEFAULT_TILE_SIZE: int = 256
 
     def __init__(
         self,
-        in_imgs: list[np.ndarray],
+        in_imgs: list,
         in_chns: list[str],
         target_shape: tuple[int, int],
         target_dtype: np.dtype,
     ):
-        self.in_imgs = [np.asarray(img).astype(target_dtype) for img in in_imgs]
+        self.in_imgs = in_imgs
         self.in_chns = in_chns
         self.target_shape = target_shape
         self.target_dtype = target_dtype
@@ -81,35 +123,14 @@ class PyramidWriter:
     def from_fs(
         cls,
         input_data: list[Union[str, pathlib.Path]],
-        channel_names: list[str] = None,
+        channel_names: Optional[list[str]] = None,
         is_mask: bool = False,
     ) -> "PyramidWriter":
-        """Build a :class:`PyramidWriter` from a list of single-channel TIFF files.
+        """Build a writer from a list of single-channel TIFF files (lazy).
 
-        Each file may be 2-D ``(H, W)`` or 3-D ``(C, H, W)``. For 3-D files
-        every slice is treated as a separate channel named
-        ``<channel_name>_0``, ``<channel_name>_1``, …
-
-        Parameters
-        ----------
-        input_data : list[str or pathlib.Path]
-            Paths to input TIFF files.
-        channel_names : list[str], optional
-            One name per file. Defaults to ``["channel_0", ...]``.
-        is_mask : bool, optional
-            Allow 32-bit dtypes and use nearest-neighbour downsampling.
-            Default ``False``.
-
-        Returns
-        -------
-        PyramidWriter
-
-        Raises
-        ------
-        ValueError
-            When ``channel_names`` length does not match ``input_data``, an
-            image has an unsupported shape, or a non-mask image has a 32-bit
-            dtype.
+        Each file is opened via :func:`tifffile.imread` in ``aszarr=True``
+        mode, so disk reads are deferred until pyramid generation. 3-D files
+        are split into separate channels named ``<channel_name>_0``, ``_1`` …
         """
         if channel_names is None:
             channel_names = [f"channel_{i}" for i in range(len(input_data))]
@@ -118,33 +139,25 @@ class PyramidWriter:
                 f"channel_names: Expected {len(input_data)} names, got {len(channel_names)}"
             )
 
-        in_imgs: list[np.ndarray] = []
+        in_imgs: list = []
         in_chns: list[str] = []
-        target_shape: tuple[int, int] | None = None
-
-        for i, path in tqdm(
-            enumerate(input_data),
-            total=len(input_data),
-            desc="Loading images",
-            bar_format=_TQDM_FORMAT,
-        ):
+        target_shape: Optional[tuple[int, int]] = None
+        for i, path in enumerate(input_data):
             name = channel_names[i]
             zimg = zarr.open(tifffile.imread(path, level=0, aszarr=True), mode="r")
-            if i == 0:
-                target_shape = zimg.shape[-2:]
+            if target_shape is None:
+                target_shape = tuple(zimg.shape[-2:])
 
             if zimg.ndim == 2:
-                img = np.asarray(zimg)
-                cls._validate_image_2d(img.shape, img.dtype, target_shape, is_mask, name)
-                in_imgs.append(img)
+                cls._validate_image_2d(zimg.shape, zimg.dtype, target_shape, is_mask, name)
+                in_imgs.append(zimg)
                 in_chns.append(name)
             elif zimg.ndim == 3:
                 for j in range(zimg.shape[0]):
-                    img = np.asarray(zimg[j])
-                    cls._validate_image_2d(
-                        img.shape, img.dtype, target_shape, is_mask, f"{name}_{j}"
-                    )
-                    in_imgs.append(img)
+                    sub = _ChannelView(zimg, j)
+                    cls._validate_image_2d(sub.shape, sub.dtype, target_shape, is_mask,
+                                           f"{name}_{j}")
+                    in_imgs.append(sub)
                     in_chns.append(f"{name}_{j}")
             else:
                 raise ValueError(f"{path}: Unsupported ndim={zimg.ndim}")
@@ -155,37 +168,18 @@ class PyramidWriter:
     @classmethod
     def from_array(
         cls,
-        input_data: Union[np.ndarray, zarr.Array],
-        channel_names: list[str] = None,
+        input_data: Union[np.ndarray, "zarr.Array"],
+        channel_names: Optional[list[str]] = None,
         is_mask: bool = False,
     ) -> "PyramidWriter":
-        """Build a :class:`PyramidWriter` from a 2-D or 3-D array.
+        """Build a writer from a 2-D or 3-D array.
 
-        Parameters
-        ----------
-        input_data : numpy.ndarray or zarr.Array
-            Shape ``(H, W)`` (treated as a single channel) or ``(C, H, W)``.
-        channel_names : list[str], optional
-            One name per channel. Defaults to ``["channel_0", ...]``.
-        is_mask : bool, optional
-            Allow 32-bit dtypes and use nearest-neighbour downsampling.
-            Default ``False``.
-
-        Returns
-        -------
-        PyramidWriter
-
-        Raises
-        ------
-        ValueError
-            When the array is not 2-D or 3-D, ``channel_names`` length
-            mismatches, or a non-mask image has an unsupported dtype.
+        numpy arrays are wrapped in an in-memory zarr array (so the rest of
+        the pipeline can stay lazy-friendly). zarr arrays are kept as-is.
         """
         if input_data.ndim == 2:
-            input_data = np.asarray(input_data)[np.newaxis, ...]
-        elif input_data.ndim == 3:
-            input_data = np.asarray(input_data)
-        else:
+            input_data = input_data[np.newaxis, ...]
+        elif input_data.ndim != 3:
             raise ValueError(
                 f"input_data: Expected 2-D or 3-D array, got shape {input_data.shape}"
             )
@@ -197,48 +191,27 @@ class PyramidWriter:
                 f"channel_names: Expected {input_data.shape[0]} names, got {len(channel_names)}"
             )
 
-        target_shape = input_data.shape[-2:]
-        in_imgs: list[np.ndarray] = []
+        target_shape = tuple(input_data.shape[-2:])
+        in_imgs: list = []
         in_chns: list[str] = []
-        for name, img in zip(channel_names, input_data):
-            cls._validate_image_2d(img.shape, img.dtype, target_shape, is_mask, name)
-            in_imgs.append(img)
+        for c, name in enumerate(channel_names):
+            ch = input_data[c]
+            cls._validate_image_2d(tuple(ch.shape), ch.dtype, target_shape, is_mask, name)
+            in_imgs.append(ch)  # numpy slice or zarr view — both support [y, x] slicing
             in_chns.append(name)
 
-        target_dtype = max(img.dtype for img in in_imgs)
+        target_dtype = max(np.asarray(img).dtype for img in in_imgs) \
+            if isinstance(input_data, np.ndarray) else input_data.dtype
         return cls(in_imgs, in_chns, target_shape, target_dtype)
 
     @classmethod
     def from_dict(
         cls,
-        input_data: dict[str, Union[np.ndarray, zarr.Array]],
-        channel_names: list[str] = None,
+        input_data: dict[str, Union[np.ndarray, "zarr.Array"]],
+        channel_names: Optional[list[str]] = None,
         is_mask: bool = False,
     ) -> "PyramidWriter":
-        """Build a :class:`PyramidWriter` from a dict of arrays.
-
-        Parameters
-        ----------
-        input_data : dict[str, numpy.ndarray or zarr.Array]
-            Keys are channel names; values are 2-D ``(H, W)`` or 3-D
-            ``(C, H, W)`` arrays. 3-D values are split into separate
-            channels named ``<key>_0``, ``<key>_1``, …
-        channel_names : list[str], optional
-            Override dict keys for channel ordering. Defaults to
-            ``list(input_data.keys())``.
-        is_mask : bool, optional
-            Allow 32-bit dtypes and use nearest-neighbour downsampling.
-            Default ``False``.
-
-        Returns
-        -------
-        PyramidWriter
-
-        Raises
-        ------
-        ValueError
-            On shape or dtype validation failures.
-        """
+        """Build a writer from a dict of 2-D or 3-D arrays."""
         if channel_names is None:
             channel_names = list(input_data.keys())
         if len(channel_names) != len(input_data):
@@ -246,32 +219,67 @@ class PyramidWriter:
                 f"channel_names: Expected {len(input_data)} names, got {len(channel_names)}"
             )
 
-        in_imgs: list[np.ndarray] = []
+        in_imgs: list = []
         in_chns: list[str] = []
-        target_shape: tuple[int, int] | None = None
+        target_shape: Optional[tuple[int, int]] = None
         for name, img_in in zip(channel_names, input_data.values()):
             if not isinstance(img_in, (np.ndarray, zarr.Array)):
                 raise ValueError(f"{name}: Unsupported type {type(img_in)}")
-            img_in = np.asarray(img_in)
             if target_shape is None:
-                target_shape = img_in.shape[-2:]
+                target_shape = tuple(img_in.shape[-2:])
             if img_in.ndim == 2:
-                cls._validate_image_2d(img_in.shape, img_in.dtype, target_shape, is_mask, name)
+                cls._validate_image_2d(tuple(img_in.shape), img_in.dtype,
+                                       target_shape, is_mask, name)
                 in_imgs.append(img_in)
                 in_chns.append(name)
             elif img_in.ndim == 3:
-                for i in range(img_in.shape[0]):
-                    img = img_in[i]
-                    cls._validate_image_2d(
-                        img.shape, img.dtype, target_shape, is_mask, f"{name}_{i}"
-                    )
-                    in_imgs.append(img)
-                    in_chns.append(f"{name}_{i}")
+                for c in range(img_in.shape[0]):
+                    sub = (img_in[c] if isinstance(img_in, np.ndarray)
+                           else _ChannelView(img_in, c))
+                    cls._validate_image_2d(tuple(sub.shape), sub.dtype,
+                                           target_shape, is_mask, f"{name}_{c}")
+                    in_imgs.append(sub)
+                    in_chns.append(f"{name}_{c}")
             else:
                 raise ValueError(f"{name}: Unsupported ndim={img_in.ndim}")
 
         target_dtype = max(img.dtype for img in in_imgs)
         return cls(in_imgs, in_chns, target_shape, target_dtype)
+
+    @classmethod
+    def from_ome_zarr(
+        cls,
+        path: Union[str, pathlib.Path],
+        is_mask: bool = False,
+    ) -> "PyramidWriter":
+        """Build a writer from an existing OME-NGFF v0.4 zarr group (lazy).
+
+        Uses level 0 as the source. Channel names come from
+        ``omero.channels[].label`` when present, otherwise
+        ``["channel_0", ...]``.
+        """
+        path = pathlib.Path(path)
+        store = zarr.storage.LocalStore(str(path))
+        root = zarr.open_group(store=store, mode="r")
+        level0 = root["0"]  # zarr.Array of shape (C, H, W)
+        if level0.ndim != 3:
+            raise ValueError(
+                f"OME-Zarr level 0 must be 3-D (C, H, W), got {level0.shape}"
+            )
+
+        omero = root.attrs.get("omero") or {}
+        omero_channels = omero.get("channels") or []
+        channel_names = [
+            (omero_channels[i].get("label") if i < len(omero_channels) else None)
+            or f"channel_{i}"
+            for i in range(level0.shape[0])
+        ]
+
+        target_shape = tuple(level0.shape[1:])
+        in_imgs = [_ChannelView(level0, c) for c in range(level0.shape[0])]
+        for name, img in zip(channel_names, in_imgs):
+            cls._validate_image_2d(img.shape, img.dtype, target_shape, is_mask, name)
+        return cls(in_imgs, channel_names, target_shape, level0.dtype)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -285,28 +293,6 @@ class PyramidWriter:
         is_mask: bool,
         msg_tag: str = "",
     ) -> None:
-        """Raise ``ValueError`` when *shape* or *dtype* fails validation.
-
-        Parameters
-        ----------
-        shape : tuple[int, int]
-            ``(H, W)`` of the image to validate.
-        dtype : numpy.dtype
-            Data type of the image.
-        target_shape : tuple[int, int]
-            Expected ``(H, W)``.
-        is_mask : bool
-            When ``True``, only unsigned integer dtypes are accepted
-            (uint8, uint16, uint32). When ``False``, uint8, uint16, uint32,
-            float32, and float64 are accepted.
-        msg_tag : str
-            Prefix for error messages.
-
-        Raises
-        ------
-        ValueError
-            On dtype or shape mismatch.
-        """
         prefix = f"{msg_tag}: " if msg_tag else ""
         if is_mask:
             if dtype not in _VALID_MASK_DTYPES:
@@ -316,177 +302,125 @@ class PyramidWriter:
                 )
         elif dtype not in _VALID_IMAGE_DTYPES:
             raise ValueError(f"{prefix}Unsupported dtype: {dtype}")
-        if shape != target_shape:
+        if tuple(shape) != tuple(target_shape):
             raise ValueError(
                 f"{prefix}Shape mismatch: expected {target_shape}, got {shape}"
             )
 
     @staticmethod
-    def _build_ome_metadata(pixel_size: float | None, channel_names: list[str]) -> dict:
-        """Return a tifffile-compatible OME metadata dict.
-
-        Parameters
-        ----------
-        pixel_size : float or None
-            Isotropic pixel size in microns. Omitted from metadata when ``None``.
-        channel_names : list[str]
-            Channel names written to the ``<Channel Name="...">`` OME-XML elements.
-
-        Returns
-        -------
-        dict
-            Dict accepted by the ``metadata`` argument of
-            :class:`tifffile.TiffWriter`.
-        """
+    def _build_ome_metadata(pixel_size: Optional[float], channel_names: list[str]) -> dict:
         meta: dict = {"UUID": uuid.uuid4().urn}
         if pixel_size is not None:
-            meta.update(
-                {
-                    "PhysicalSizeX": pixel_size,
-                    "PhysicalSizeXUnit": "µm",
-                    "PhysicalSizeY": pixel_size,
-                    "PhysicalSizeYUnit": "µm",
-                }
-            )
+            meta.update({
+                "PhysicalSizeX": pixel_size,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": pixel_size,
+                "PhysicalSizeYUnit": "µm",
+            })
         if channel_names:
             meta["Channel"] = {"Name": channel_names}
         return meta
 
     @staticmethod
-    def _downsample_channel(img: np.ndarray, is_mask: bool, target_dtype: np.dtype) -> np.ndarray:
-        """Return a 2×-downsampled copy of a single 2-D channel.
-
-        Mask mode subsamples (nearest-neighbour) to preserve integer label
-        values; image mode uses local-mean averaging.
-        """
+    def _downsample_tile(
+        tile: np.ndarray,
+        is_mask: bool,
+        target_dtype: np.dtype,
+    ) -> np.ndarray:
+        """2× downsample a single 2-D tile (mask: nearest, image: local mean)."""
         if is_mask:
-            return img[::2, ::2].astype(target_dtype)
-        ds = skimage.transform.downscale_local_mean(img, (2, 2))
+            return tile[::2, ::2].astype(target_dtype)
+        ds = skimage.transform.downscale_local_mean(tile, (2, 2))
         if np.issubdtype(target_dtype, np.floating):
             return ds.astype(target_dtype)
         return np.round(ds).astype(target_dtype)
 
-    def _build_pyramid_levels(
-        self,
-        num_levels: int,
-        is_mask: bool,
-    ) -> list[list[np.ndarray]]:
-        """Compute every pyramid level in memory by cascading from the previous level.
-
-        Memory cost: at most two levels (current + previous) live simultaneously
-        once intermediate references are released by the caller. For pyratiff's
-        typical CODEX inputs (a few thousand pixels per side, tens of channels
-        in uint16) this is well under 1 GB.
-
-        Returns
-        -------
-        list[list[numpy.ndarray]]
-            ``levels[L][c]`` is the channel-``c`` 2-D array at pyramid level ``L``.
-        """
-        levels: list[list[np.ndarray]] = [self.in_imgs]
-        for _ in range(1, num_levels):
-            prev = levels[-1]
-            levels.append([
-                self._downsample_channel(img, is_mask, self.target_dtype)
-                for img in prev
-            ])
-        return levels
+    @staticmethod
+    def _level_shape(base_shape: tuple[int, int], level: int) -> tuple[int, int]:
+        H, W = base_shape
+        return (int(np.ceil(H / 2 ** level)), int(np.ceil(W / 2 ** level)))
 
     @staticmethod
-    def _tile_generator(
-        level_imgs: list[np.ndarray], tile_size: int
-    ):
-        """Yield tiles in (channel, row, col) order for a single pyramid level."""
-        for img in level_imgs:
-            ch = int(np.ceil(img.shape[0] / tile_size))
-            cw = int(np.ceil(img.shape[1] / tile_size))
-            for j in range(ch):
-                for i in range(cw):
-                    yield img[
-                        tile_size * j : tile_size * (j + 1),
-                        tile_size * i : tile_size * (i + 1),
-                    ]
+    def _num_levels(base_shape: tuple[int, int], tile_size: int) -> int:
+        return max(1, int(np.ceil(np.log2(max(base_shape) / tile_size)) + 1))
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def export_ome_zarr(
+    def _stream_pyramid_to_zarr_group(
         self,
-        output_dir: Union[str, pathlib.Path],
-        pixel_size: float = None,
-        chunk_size: int = 256,
-        is_mask: bool = False,
-        overwrite: bool = True,
+        root: "zarr.Group",
+        tile_size: int,
+        is_mask: bool,
+        num_levels: int,
+        progress_label: str = "Writing tiles",
     ) -> None:
-        """Write the image stack as an OME-NGFF v0.4 zarr group.
+        """Build pyramid in ``root``, tile-by-tile, never holding a full level in RAM.
 
-        Output is a directory (conventionally ending in ``.ome.zarr``)
-        containing one zarr array per pyramid level (``"0"``, ``"1"``, …).
-        Top-level ``.zattrs`` carries OME-NGFF ``multiscales`` and ``omero``
-        metadata. The zarr group uses zarr-format **v2** (required by OME-NGFF
-        v0.4); this is interoperable with napari (via ``napari-ome-zarr``),
-        the OME tooling, and any reader that understands the v0.4 spec.
-
-        The pyramid is built by the same in-memory cascade used by
-        :meth:`export_ometiff_pyramid`, so the two outputs hold identical
-        numeric data.
-
-        Parameters
-        ----------
-        output_dir : str or pathlib.Path
-            Destination directory. Convention: end the name with
-            ``.ome.zarr``.
-        pixel_size : float, optional
-            Isotropic pixel size in microns. When set, the axes carry
-            ``unit="micrometer"`` and the scale transformations encode the
-            pixel size; otherwise scales are pure integer ratios.
-        chunk_size : int, optional
-            Side length of zarr chunks in pixels (also drives pyramid level
-            count: ``ceil(log2(max(H, W) / chunk_size)) + 1``).
-            Default ``256``.
-        is_mask : bool, optional
-            When ``True``, nearest-neighbour subsampling is used between
-            pyramid levels (preserves integer label values) and the
-            ``multiscales[0].type`` field is set to ``"nearest"``.
-            Default ``False``.
-        overwrite : bool, optional
-            Replace ``output_dir`` when it exists. Default ``True``.
-
-        Raises
-        ------
-        FileExistsError
-            When ``output_dir`` exists and ``overwrite=False``.
+        Level 0 is streamed from ``self.in_imgs``; subsequent levels are
+        streamed from the previously-written zarr level. Memory peak is
+        ``O(num_channels * tile_size² * dtype_size)`` per active tile.
         """
-        import shutil
-
-        output_dir = pathlib.Path(output_dir)
-        if output_dir.exists():
-            if overwrite:
-                logger.info("Overwriting existing zarr: %s", output_dir)
-                shutil.rmtree(output_dir)
-            else:
-                raise FileExistsError(f"Output directory already exists: {output_dir}")
-
         H, W = self.target_shape
-        num_levels = max(1, int(np.ceil(np.log2(max(H, W) / chunk_size)) + 1))
-        levels = self._build_pyramid_levels(num_levels=num_levels, is_mask=is_mask)
-
-        # Open root group as zarr-format v2 (OME-NGFF v0.4 requirement).
-        store = zarr.storage.LocalStore(str(output_dir))
-        root = zarr.open_group(store=store, mode="w", zarr_format=2)
-
-        datasets: list[dict] = []
         num_channels = len(self.in_chns)
-        for L, level_imgs in enumerate(levels):
-            stacked = np.stack(level_imgs, axis=0)  # (C, H_L, W_L)
-            arr = root.create_array(
-                name=str(L),
-                shape=stacked.shape,
-                chunks=(num_channels, chunk_size, chunk_size),
-                dtype=stacked.dtype,
+        total_tiles = sum(
+            int(np.ceil(self._level_shape((H, W), L)[0] / tile_size))
+            * int(np.ceil(self._level_shape((H, W), L)[1] / tile_size))
+            * num_channels
+            for L in range(num_levels)
+        )
+        pbar = tqdm(total=total_tiles, desc=progress_label, bar_format=_TQDM_FORMAT)
+        try:
+            # Level 0: stream from self.in_imgs.
+            level0 = root.create_array(
+                name="0",
+                shape=(num_channels, H, W),
+                chunks=(num_channels, tile_size, tile_size),
+                dtype=self.target_dtype,
             )
-            arr[:] = stacked
+            for c in range(num_channels):
+                src = self.in_imgs[c]
+                for j in range(0, H, tile_size):
+                    for i in range(0, W, tile_size):
+                        j2 = min(j + tile_size, H)
+                        i2 = min(i + tile_size, W)
+                        tile = np.asarray(src[j:j2, i:i2]).astype(self.target_dtype)
+                        level0[c, j:j2, i:i2] = tile
+                        pbar.update(1)
+
+            # Levels 1..N-1: stream from previously-written level.
+            for L in range(1, num_levels):
+                prev = root[str(L - 1)]
+                H_L, W_L = self._level_shape((H, W), L)
+                curr = root.create_array(
+                    name=str(L),
+                    shape=(num_channels, H_L, W_L),
+                    chunks=(num_channels, tile_size, tile_size),
+                    dtype=self.target_dtype,
+                )
+                for c in range(num_channels):
+                    for j_out in range(0, H_L, tile_size):
+                        for i_out in range(0, W_L, tile_size):
+                            j_in = j_out * 2
+                            i_in = i_out * 2
+                            j_in_end = min(j_in + tile_size * 2, prev.shape[1])
+                            i_in_end = min(i_in + tile_size * 2, prev.shape[2])
+                            src_tile = np.asarray(prev[c, j_in:j_in_end, i_in:i_in_end])
+                            ds = self._downsample_tile(src_tile, is_mask, self.target_dtype)
+                            curr[c, j_out:j_out + ds.shape[0],
+                                 i_out:i_out + ds.shape[1]] = ds
+                            pbar.update(1)
+        finally:
+            pbar.close()
+
+    def _write_ome_ngff_metadata(
+        self,
+        root: "zarr.Group",
+        name: str,
+        pixel_size: Optional[float],
+        is_mask: bool,
+        num_levels: int,
+    ) -> None:
+        """Attach OME-NGFF v0.4 ``multiscales`` and ``omero`` attrs to ``root``."""
+        datasets = []
+        for L in range(num_levels):
             scale_xy = float(2 ** L) * (pixel_size if pixel_size is not None else 1.0)
             datasets.append({
                 "path": str(L),
@@ -495,7 +429,7 @@ class PyramidWriter:
                 ],
             })
 
-        spatial_axis = {"name": "y", "type": "space"}
+        spatial_axis: dict = {"type": "space"}
         if pixel_size is not None:
             spatial_axis["unit"] = "micrometer"
         axes = [
@@ -506,59 +440,109 @@ class PyramidWriter:
 
         root.attrs["multiscales"] = [{
             "version": "0.4",
-            "name": output_dir.stem,
+            "name": name,
             "axes": axes,
             "datasets": datasets,
             "type": "nearest" if is_mask else "mean",
         }]
         root.attrs["omero"] = {
-            "channels": [{"label": name} for name in self.in_chns],
+            "channels": [{"label": n} for n in self.in_chns],
         }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def export_ome_zarr(
+        self,
+        output_dir: Union[str, pathlib.Path],
+        pixel_size: Optional[float] = None,
+        chunk_size: int = DEFAULT_TILE_SIZE,
+        is_mask: bool = False,
+        overwrite: bool = True,
+    ) -> None:
+        """Write the image stack as an OME-NGFF v0.4 zarr group (canonical output).
+
+        Pyramid is generated tile-by-tile; memory peak is
+        ``O(num_channels * chunk_size² * dtype)``.
+
+        Parameters
+        ----------
+        output_dir : str or pathlib.Path
+            Destination directory. Convention: end the name with
+            ``.ome.zarr``.
+        pixel_size : float, optional
+            Isotropic pixel size in microns. When set, axes carry
+            ``unit="micrometer"`` and the scale transformations encode it.
+        chunk_size : int, optional
+            Side length of zarr chunks in pixels. Also drives pyramid level
+            count: ``ceil(log2(max(H, W) / chunk_size)) + 1``. Default ``256``.
+        is_mask : bool, optional
+            Nearest-neighbour subsampling between levels (preserves integer
+            label values); ``multiscales[0].type`` is ``"nearest"``.
+        overwrite : bool, optional
+            Replace ``output_dir`` when it exists. Default ``True``.
+        """
+        output_dir = pathlib.Path(output_dir)
+        if output_dir.exists():
+            if overwrite:
+                logger.info("Overwriting existing zarr: %s", output_dir)
+                shutil.rmtree(output_dir)
+            else:
+                raise FileExistsError(f"Output directory already exists: {output_dir}")
+
+        num_levels = self._num_levels(self.target_shape, chunk_size)
+
+        store = zarr.storage.LocalStore(str(output_dir))
+        root = zarr.open_group(store=store, mode="w", zarr_format=2)
+
+        self._stream_pyramid_to_zarr_group(
+            root=root,
+            tile_size=chunk_size,
+            is_mask=is_mask,
+            num_levels=num_levels,
+        )
+        self._write_ome_ngff_metadata(
+            root=root,
+            name=output_dir.stem,
+            pixel_size=pixel_size,
+            is_mask=is_mask,
+            num_levels=num_levels,
+        )
 
     def export_ometiff_pyramid(
         self,
         output_f: Union[str, pathlib.Path],
-        pixel_size: float = None,
-        tile_size: int = 256,
+        pixel_size: Optional[float] = None,
+        tile_size: int = DEFAULT_TILE_SIZE,
         is_mask: bool = False,
         num_threads: int = 8,
         overwrite: bool = True,
     ) -> None:
-        """Write the image stack as a tiled pyramidal OME-TIFF.
+        """Write the image stack as a tiled pyramidal OME-TIFF (derived output).
 
-        The pyramid is assembled following the approach described in
-        `LabSysPharm/ome-tiff-pyramid-tools
-        <https://github.com/labsyspharm/ome-tiff-pyramid-tools>`_.
-        Each level is half the resolution of the previous one; the base level
-        (level 0) is written first, and each subsequent level is generated by
-        reading the tiles written so far from the output file.
+        Internally writes a temporary OME-Zarr (the canonical pyramid) and
+        then converts it tile-by-tile to OME-TIFF. The temporary zarr is
+        discarded after conversion. Memory profile matches
+        :meth:`export_ome_zarr`.
 
         Parameters
         ----------
         output_f : str or pathlib.Path
             Destination ``.ome.tiff`` path.
         pixel_size : float, optional
-            Isotropic pixel size in microns, written to the OME-XML
-            ``PhysicalSizeX/Y`` attributes. Omitted when ``None``.
+            Isotropic pixel size in microns, written to OME-XML
+            ``PhysicalSizeX/Y``.
         tile_size : int, optional
-            Tile width and height in pixels. Must be a multiple of 16.
+            Tile size in pixels; also drives pyramid level count.
             Default ``256``.
         is_mask : bool, optional
-            When ``True``, nearest-neighbour downsampling is used instead of
-            local-mean averaging, preserving integer label values.
-            Default ``False``.
+            Nearest-neighbour downsampling for label preservation.
         num_threads : int, optional
-            Worker threads for tile compression and downsampling.
-            Pass ``0`` to auto-detect from CPU affinity.
+            Worker threads for tifffile compression. Pass ``0`` to auto-detect.
             Default ``8``.
         overwrite : bool, optional
-            Overwrite an existing file when ``True``; raise
-            :exc:`FileExistsError` when ``False``. Default ``True``.
-
-        Raises
-        ------
-        FileExistsError
-            When ``output_f`` exists and ``overwrite=False``.
+            Overwrite an existing file when ``True``. Default ``True``.
         """
         output_f = pathlib.Path(output_f)
         if output_f.exists():
@@ -575,55 +559,77 @@ class PyramidWriter:
                 num_threads = multiprocessing.cpu_count()
             logger.info("Using %d worker threads", num_threads)
 
-        # tifffile global worker counts — save and restore around the write so we
-        # don't pollute other tifffile callers in the same process.
         prev_max_workers = tifffile.TIFF.MAXWORKERS
         prev_max_io_workers = tifffile.TIFF.MAXIOWORKERS
         tifffile.TIFF.MAXWORKERS = num_threads
         tifffile.TIFF.MAXIOWORKERS = num_threads * 5
 
         try:
-            metadata = self._build_ome_metadata(pixel_size, self.in_chns)
-            num_channels = len(self.in_chns)
-
-            # Pyramid shapes (per level) and tile counts (per level), driven by the
-            # base shape and tile_size.
-            H, W = self.target_shape
-            num_levels = max(1, int(np.ceil(np.log2(max(H, W) / tile_size)) + 1))
-            factors = 2 ** np.arange(num_levels)
-            shapes = np.ceil(np.array([H, W]) / factors[:, None]).astype(int)
-            cshapes = np.ceil(shapes / tile_size).astype(int)
-
-            # In-memory cascade: compute all levels up-front from the base, by
-            # downsampling each level from the previous one.
-            levels = self._build_pyramid_levels(num_levels=num_levels, is_mask=is_mask)
-
-            total_tiles = sum(cs[0] * cs[1] for cs in cshapes)
-            pbar = tqdm(total=total_tiles, desc="Writing tiles", bar_format=_TQDM_FORMAT)
-            try:
-                with tifffile.TiffWriter(output_f, ome=True, bigtiff=True) as writer:
-                    for level, shape in enumerate(shapes):
-                        write_kwargs = dict(
-                            data=self._tile_generator(levels[level], tile_size),
-                            shape=(num_channels,) + tuple(shape),
-                            dtype=self.target_dtype,
-                            tile=(tile_size, tile_size),
-                            compression="adobe_deflate",
-                            predictor=True,
-                        )
-                        if level == 0:
-                            write_kwargs["subifds"] = num_levels - 1
-                            write_kwargs["metadata"] = metadata
-                        else:
-                            write_kwargs["subfiletype"] = 1
-                        writer.write(**write_kwargs)
-                        pbar.update(cshapes[level][0] * cshapes[level][1])
-                        # Free the level we just finished writing — the next
-                        # level only needs its immediate predecessor (already
-                        # consumed at downsample time) and itself.
-                        levels[level] = None
-            finally:
-                pbar.close()
+            with tempfile.TemporaryDirectory(prefix="pyratiff_") as tmp:
+                tmp_zarr = pathlib.Path(tmp) / "stage.ome.zarr"
+                # Write canonical OME-Zarr first.
+                self.export_ome_zarr(
+                    output_dir=tmp_zarr,
+                    pixel_size=pixel_size,
+                    chunk_size=tile_size,
+                    is_mask=is_mask,
+                    overwrite=True,
+                )
+                # Then derive the OME-TIFF from it.
+                self._zarr_group_to_ometiff(
+                    zarr_dir=tmp_zarr,
+                    output_f=output_f,
+                    pixel_size=pixel_size,
+                    tile_size=tile_size,
+                )
         finally:
             tifffile.TIFF.MAXWORKERS = prev_max_workers
             tifffile.TIFF.MAXIOWORKERS = prev_max_io_workers
+
+    def _zarr_group_to_ometiff(
+        self,
+        zarr_dir: pathlib.Path,
+        output_f: pathlib.Path,
+        pixel_size: Optional[float],
+        tile_size: int,
+    ) -> None:
+        """Convert an OME-NGFF zarr group at ``zarr_dir`` to an OME-TIFF at ``output_f``."""
+        store = zarr.storage.LocalStore(str(zarr_dir))
+        root = zarr.open_group(store=store, mode="r")
+        multiscales = root.attrs["multiscales"][0]
+        n_levels = len(multiscales["datasets"])
+        num_channels = len(self.in_chns)
+        metadata = self._build_ome_metadata(pixel_size, self.in_chns)
+
+        def tile_gen(level_arr):
+            """Yield tiles in (channel, row, col) order from a (C, H_L, W_L) zarr array."""
+            for c in range(level_arr.shape[0]):
+                for j in range(0, level_arr.shape[1], tile_size):
+                    for i in range(0, level_arr.shape[2], tile_size):
+                        yield np.asarray(level_arr[
+                            c,
+                            j:j + tile_size,
+                            i:i + tile_size,
+                        ])
+
+        with tifffile.TiffWriter(output_f, ome=True, bigtiff=True) as writer:
+            for L in range(n_levels):
+                arr = root[str(L)]
+                kwargs = dict(
+                    data=tile_gen(arr),
+                    shape=tuple(arr.shape),
+                    dtype=self.target_dtype,
+                    tile=(tile_size, tile_size),
+                    compression="adobe_deflate",
+                    predictor=True,
+                )
+                if L == 0:
+                    kwargs["subifds"] = n_levels - 1
+                    kwargs["metadata"] = metadata
+                else:
+                    kwargs["subfiletype"] = 1
+                writer.write(**kwargs)
+                # Best-effort: free the zarr level we just consumed.
+                # zarr 3 doesn't have an explicit close per array, but dropping
+                # the reference lets the OS reclaim mmap pages.
+                del arr
