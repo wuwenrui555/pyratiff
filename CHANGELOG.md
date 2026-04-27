@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.0.1] - 2026-04-26
+
+### Changed
+
+- **Pyramid generation refactored to in-memory cascade** (internal). Previous
+  versions used the labsyspharm trick of reading partially-written pyramid
+  levels back from the output file to produce the next level. The new
+  approach computes each level by 2× downsampling the previous level held in
+  memory. Output is byte-identical (verified by golden-master tests across
+  uint16, uint32 mask, and float32 inputs); behavior depends only on
+  `skimage.transform.downscale_local_mean` rather than on any tifffile
+  flush-on-write semantics.
+- `print(...)` calls in `export_ometiff_pyramid` replaced with
+  `logging.info(...)` (`pyratiff.writer` logger).
+- `tifffile.TIFF.MAXWORKERS` and `MAXIOWORKERS` now saved and restored
+  around each export, avoiding global-state pollution for other tifffile
+  callers in the same process.
+- `concurrent.futures.ThreadPoolExecutor` removed (no longer needed —
+  per-tile work is just an array slice).
+
+### Added
+
+- 3 golden-master tests (`test_export_pyramid_level_values_uint16`,
+  `..._mask`, `..._float`) verifying every pyramid level matches the
+  reference downsample of its predecessor.
+
+### Why
+
+Removes the dependency on tifffile's undocumented "subifd flushed before
+subsequent reads" behavior; simpler code path; easier to swap for a
+zarr-native (OME-NGFF) backend in the future.
+
 ## [1.0.0] - 2026-03-05
 
 Initial release.

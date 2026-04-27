@@ -290,6 +290,89 @@ def test_export_pixel_values_preserved(tmp_path):
     np.testing.assert_array_equal(result, data)
 
 
+def _expected_downsampled(prev: np.ndarray, is_mask: bool, target_dtype) -> np.ndarray:
+    """Reference 2x downsample, mirrors PyramidWriter's per-tile logic."""
+    import skimage.transform
+    if is_mask:
+        return prev[..., ::2, ::2].astype(target_dtype)
+    if prev.ndim == 2:
+        ds = skimage.transform.downscale_local_mean(prev, (2, 2))
+    else:  # (C, H, W) → downsample H, W only
+        ds = np.stack([
+            skimage.transform.downscale_local_mean(prev[c], (2, 2))
+            for c in range(prev.shape[0])
+        ])
+    if np.issubdtype(target_dtype, np.floating):
+        return ds.astype(target_dtype)
+    return np.round(ds).astype(target_dtype)
+
+
+def test_export_pyramid_level_values_uint16(tmp_path):
+    """Each pyramid level must be the local-mean downsample of the previous one (uint16)."""
+    out = tmp_path / "out.ome.tiff"
+    rng = np.random.default_rng(42)
+    data = rng.integers(0, 1000, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ometiff_pyramid(out, tile_size=128)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    # Build expected pyramid via in-memory cascade.
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=False,
+                                              target_dtype=np.uint16))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mismatch")
+
+
+def test_export_pyramid_level_values_mask(tmp_path):
+    """Mask mode uses nearest-neighbour subsampling."""
+    out = tmp_path / "mask.ome.tiff"
+    rng = np.random.default_rng(7)
+    # 2 channels so tifffile keeps the channel dim on read.
+    data = rng.integers(0, 50, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["labels_a", "labels_b"], is_mask=True)
+    writer.export_ometiff_pyramid(out, tile_size=128, is_mask=True)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=True,
+                                              target_dtype=np.uint16))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mask mismatch")
+
+
+def test_export_pyramid_level_values_float(tmp_path):
+    """Float dtype skips the round() step in downsampling."""
+    out = tmp_path / "out.ome.tiff"
+    rng = np.random.default_rng(13)
+    data = rng.random((2, 512, 512), dtype=np.float32)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ometiff_pyramid(out, tile_size=128)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=False,
+                                              target_dtype=np.float32))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_allclose(actual, exp, rtol=1e-5,
+                                   err_msg=f"level {L} float mismatch")
+
+
 # ---------------------------------------------------------------------------
 # float dtype support
 # ---------------------------------------------------------------------------

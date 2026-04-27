@@ -1,7 +1,6 @@
 """PyramidWriter — assemble multi-channel pyramidal OME-TIFF files."""
 
-import concurrent.futures
-import itertools
+import logging
 import multiprocessing
 import os
 import pathlib
@@ -13,6 +12,8 @@ import skimage.transform
 import tifffile
 import zarr
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 _TQDM_FORMAT = (
     "{desc}: {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt}"
@@ -351,73 +352,60 @@ class PyramidWriter:
             meta["Channel"] = {"Name": channel_names}
         return meta
 
-    def _make_tile_generators(
+    @staticmethod
+    def _downsample_channel(img: np.ndarray, is_mask: bool, target_dtype: np.dtype) -> np.ndarray:
+        """Return a 2×-downsampled copy of a single 2-D channel.
+
+        Mask mode subsamples (nearest-neighbour) to preserve integer label
+        values; image mode uses local-mean averaging.
+        """
+        if is_mask:
+            return img[::2, ::2].astype(target_dtype)
+        ds = skimage.transform.downscale_local_mean(img, (2, 2))
+        if np.issubdtype(target_dtype, np.floating):
+            return ds.astype(target_dtype)
+        return np.round(ds).astype(target_dtype)
+
+    def _build_pyramid_levels(
         self,
-        output_f: pathlib.Path,
-        tile_size: int,
+        num_levels: int,
         is_mask: bool,
-        num_threads: int,
-    ):
-        """Create tile generator functions for the base level and pyramid levels.
+    ) -> list[list[np.ndarray]]:
+        """Compute every pyramid level in memory by cascading from the previous level.
+
+        Memory cost: at most two levels (current + previous) live simultaneously
+        once intermediate references are released by the caller. For pyratiff's
+        typical CODEX inputs (a few thousand pixels per side, tens of channels
+        in uint16) this is well under 1 GB.
 
         Returns
         -------
-        tiles0 : callable
-            Generator yielding tiles for pyramid level 0.
-        tiles : callable
-            Generator factory; ``tiles(level)`` yields tiles for the given level
-            by reading the partially-written output file and downsampling 2×.
-        num_levels : int
-            Total number of pyramid levels including the base.
-        shapes : numpy.ndarray
-            ``(num_levels, 2)`` array of ``(H, W)`` at each level.
-        cshapes : numpy.ndarray
-            ``(num_levels, 2)`` array of tile counts ``(rows, cols)`` at each level.
+        list[list[numpy.ndarray]]
+            ``levels[L][c]`` is the channel-``c`` 2-D array at pyramid level ``L``.
         """
-        H, W = self.target_shape
-        num_levels = max(1, int(np.ceil(np.log2(max(H, W) / tile_size)) + 1))
-        factors = 2 ** np.arange(num_levels)
-        shapes = np.ceil(np.array([H, W]) / factors[:, None]).astype(int)
-        cshapes = np.ceil(shapes / tile_size).astype(int)
+        levels: list[list[np.ndarray]] = [self.in_imgs]
+        for _ in range(1, num_levels):
+            prev = levels[-1]
+            levels.append([
+                self._downsample_channel(img, is_mask, self.target_dtype)
+                for img in prev
+            ])
+        return levels
 
-        in_imgs = self.in_imgs
-        target_dtype = self.target_dtype
-        num_channels = len(self.in_chns)
-        pool = concurrent.futures.ThreadPoolExecutor(num_threads)
-
-        def tiles0():
-            ts = tile_size
-            ch, cw = cshapes[0]
-            for img in in_imgs:
-                for j in range(ch):
-                    for i in range(cw):
-                        yield img[ts * j : ts * (j + 1), ts * i : ts * (i + 1)]
-
-        def tiles(level: int):
-            with tifffile.TiffFile(output_f, is_ome=False) as tiff_out:
-                zimg = zarr.open(
-                    tiff_out.series[0].aszarr(level=level - 1), mode="r"
-                )
-                ts = tile_size * 2
-
-                def tile(coords):
-                    c, j, i = coords
-                    if zimg.ndim == 2:
-                        t = zimg[ts * j : ts * (j + 1), ts * i : ts * (i + 1)]
-                    else:
-                        t = zimg[c, ts * j : ts * (j + 1), ts * i : ts * (i + 1)]
-                    if is_mask:
-                        return t[::2, ::2].astype(target_dtype)
-                    downsampled = skimage.transform.downscale_local_mean(t, (2, 2))
-                    if np.issubdtype(target_dtype, np.floating):
-                        return downsampled.astype(target_dtype)
-                    return np.round(downsampled).astype(target_dtype)
-
-                ch, cw = cshapes[level]
-                coords = itertools.product(range(num_channels), range(ch), range(cw))
-                yield from pool.map(tile, coords)
-
-        return tiles0, tiles, num_levels, shapes, cshapes
+    @staticmethod
+    def _tile_generator(
+        level_imgs: list[np.ndarray], tile_size: int
+    ):
+        """Yield tiles in (channel, row, col) order for a single pyramid level."""
+        for img in level_imgs:
+            ch = int(np.ceil(img.shape[0] / tile_size))
+            cw = int(np.ceil(img.shape[1] / tile_size))
+            for j in range(ch):
+                for i in range(cw):
+                    yield img[
+                        tile_size * j : tile_size * (j + 1),
+                        tile_size * i : tile_size * (i + 1),
+                    ]
 
     # ------------------------------------------------------------------
     # Public API
@@ -471,7 +459,7 @@ class PyramidWriter:
         output_f = pathlib.Path(output_f)
         if output_f.exists():
             if overwrite:
-                print(f"Overwriting existing file: {output_f}")
+                logger.info("Overwriting existing file: %s", output_f)
                 output_f.unlink()
             else:
                 raise FileExistsError(f"Output file already exists: {output_f}")
@@ -481,46 +469,57 @@ class PyramidWriter:
                 num_threads = len(os.sched_getaffinity(0))
             else:
                 num_threads = multiprocessing.cpu_count()
-            print(f"Using {num_threads} worker threads")
+            logger.info("Using %d worker threads", num_threads)
 
+        # tifffile global worker counts — save and restore around the write so we
+        # don't pollute other tifffile callers in the same process.
+        prev_max_workers = tifffile.TIFF.MAXWORKERS
+        prev_max_io_workers = tifffile.TIFF.MAXIOWORKERS
         tifffile.TIFF.MAXWORKERS = num_threads
         tifffile.TIFF.MAXIOWORKERS = num_threads * 5
 
-        metadata = self._build_ome_metadata(pixel_size, self.in_chns)
-        num_channels = len(self.in_chns)
-        tiles0, tiles, num_levels, shapes, cshapes = self._make_tile_generators(
-            output_f=output_f,
-            tile_size=tile_size,
-            is_mask=is_mask,
-            num_threads=num_threads,
-        )
+        try:
+            metadata = self._build_ome_metadata(pixel_size, self.in_chns)
+            num_channels = len(self.in_chns)
 
-        total_tiles = sum(cs[0] * cs[1] for cs in cshapes)
-        pbar = tqdm(total=total_tiles, desc="Writing tiles", bar_format=_TQDM_FORMAT)
+            # Pyramid shapes (per level) and tile counts (per level), driven by the
+            # base shape and tile_size.
+            H, W = self.target_shape
+            num_levels = max(1, int(np.ceil(np.log2(max(H, W) / tile_size)) + 1))
+            factors = 2 ** np.arange(num_levels)
+            shapes = np.ceil(np.array([H, W]) / factors[:, None]).astype(int)
+            cshapes = np.ceil(shapes / tile_size).astype(int)
 
-        with tifffile.TiffWriter(output_f, ome=True, bigtiff=True) as writer:
-            for level, shape in enumerate(shapes):
-                if level == 0:
-                    writer.write(
-                        data=tiles0(),
-                        shape=(num_channels,) + tuple(shape),
-                        subifds=num_levels - 1,
-                        dtype=self.target_dtype,
-                        tile=(tile_size, tile_size),
-                        compression="adobe_deflate",
-                        predictor=True,
-                        metadata=metadata,
-                    )
-                else:
-                    writer.write(
-                        data=tiles(level),
-                        shape=(num_channels,) + tuple(shape),
-                        subfiletype=1,
-                        dtype=self.target_dtype,
-                        tile=(tile_size, tile_size),
-                        compression="adobe_deflate",
-                        predictor=True,
-                    )
-                pbar.update(cshapes[level][0] * cshapes[level][1])
+            # In-memory cascade: compute all levels up-front from the base, by
+            # downsampling each level from the previous one.
+            levels = self._build_pyramid_levels(num_levels=num_levels, is_mask=is_mask)
 
-        pbar.close()
+            total_tiles = sum(cs[0] * cs[1] for cs in cshapes)
+            pbar = tqdm(total=total_tiles, desc="Writing tiles", bar_format=_TQDM_FORMAT)
+            try:
+                with tifffile.TiffWriter(output_f, ome=True, bigtiff=True) as writer:
+                    for level, shape in enumerate(shapes):
+                        write_kwargs = dict(
+                            data=self._tile_generator(levels[level], tile_size),
+                            shape=(num_channels,) + tuple(shape),
+                            dtype=self.target_dtype,
+                            tile=(tile_size, tile_size),
+                            compression="adobe_deflate",
+                            predictor=True,
+                        )
+                        if level == 0:
+                            write_kwargs["subifds"] = num_levels - 1
+                            write_kwargs["metadata"] = metadata
+                        else:
+                            write_kwargs["subfiletype"] = 1
+                        writer.write(**write_kwargs)
+                        pbar.update(cshapes[level][0] * cshapes[level][1])
+                        # Free the level we just finished writing — the next
+                        # level only needs its immediate predecessor (already
+                        # consumed at downsample time) and itself.
+                        levels[level] = None
+            finally:
+                pbar.close()
+        finally:
+            tifffile.TIFF.MAXWORKERS = prev_max_workers
+            tifffile.TIFF.MAXIOWORKERS = prev_max_io_workers
