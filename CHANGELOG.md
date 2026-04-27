@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.1.0] - 2026-04-26
+
+### Added
+
+- **`PyramidWriter.export_ome_zarr(output_dir, ...)`** — write the same image
+  stack as an [OME-NGFF v0.4](https://ngff.openmicroscopy.org/0.4/) zarr
+  group. Output is a directory (conventionally `*.ome.zarr`) containing one
+  zarr array per pyramid level plus `multiscales` and `omero` metadata in
+  `.zattrs`. Interoperable with napari (via `napari-ome-zarr`) and any
+  OME-NGFF v0.4 reader.
+  - Reuses the same in-memory pyramid cascade as `export_ometiff_pyramid`,
+    so OME-Zarr and OME-TIFF outputs hold byte-identical pyramid data
+    (verified by `test_ome_zarr_and_ometiff_byte_identical`).
+  - Mask mode (`is_mask=True`) uses nearest-neighbour subsampling and sets
+    `multiscales[0].type = "nearest"`.
+  - Pixel size in microns flows through to the per-axis `unit` and
+    coordinate-transformation `scale` fields.
+- 9 new tests covering directory structure, overwrite semantics, multiscales
+  metadata correctness, omero channel labels, mask mode, and cross-format
+  byte-identity with OME-TIFF.
+
+### Why
+
+Long-term direction is napari + OME-NGFF; OME-Zarr is the modern format the
+OME consortium is steering toward. OME-TIFF stays as the default for
+QuPath compatibility. Both methods coexist; pick whichever the downstream
+tool needs (or write both side by side from one writer instance).
+
 ## [1.0.1] - 2026-04-26
 
 ### Changed

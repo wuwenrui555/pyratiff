@@ -411,6 +411,110 @@ class PyramidWriter:
     # Public API
     # ------------------------------------------------------------------
 
+    def export_ome_zarr(
+        self,
+        output_dir: Union[str, pathlib.Path],
+        pixel_size: float = None,
+        chunk_size: int = 256,
+        is_mask: bool = False,
+        overwrite: bool = True,
+    ) -> None:
+        """Write the image stack as an OME-NGFF v0.4 zarr group.
+
+        Output is a directory (conventionally ending in ``.ome.zarr``)
+        containing one zarr array per pyramid level (``"0"``, ``"1"``, …).
+        Top-level ``.zattrs`` carries OME-NGFF ``multiscales`` and ``omero``
+        metadata. The zarr group uses zarr-format **v2** (required by OME-NGFF
+        v0.4); this is interoperable with napari (via ``napari-ome-zarr``),
+        the OME tooling, and any reader that understands the v0.4 spec.
+
+        The pyramid is built by the same in-memory cascade used by
+        :meth:`export_ometiff_pyramid`, so the two outputs hold identical
+        numeric data.
+
+        Parameters
+        ----------
+        output_dir : str or pathlib.Path
+            Destination directory. Convention: end the name with
+            ``.ome.zarr``.
+        pixel_size : float, optional
+            Isotropic pixel size in microns. When set, the axes carry
+            ``unit="micrometer"`` and the scale transformations encode the
+            pixel size; otherwise scales are pure integer ratios.
+        chunk_size : int, optional
+            Side length of zarr chunks in pixels (also drives pyramid level
+            count: ``ceil(log2(max(H, W) / chunk_size)) + 1``).
+            Default ``256``.
+        is_mask : bool, optional
+            When ``True``, nearest-neighbour subsampling is used between
+            pyramid levels (preserves integer label values) and the
+            ``multiscales[0].type`` field is set to ``"nearest"``.
+            Default ``False``.
+        overwrite : bool, optional
+            Replace ``output_dir`` when it exists. Default ``True``.
+
+        Raises
+        ------
+        FileExistsError
+            When ``output_dir`` exists and ``overwrite=False``.
+        """
+        import shutil
+
+        output_dir = pathlib.Path(output_dir)
+        if output_dir.exists():
+            if overwrite:
+                logger.info("Overwriting existing zarr: %s", output_dir)
+                shutil.rmtree(output_dir)
+            else:
+                raise FileExistsError(f"Output directory already exists: {output_dir}")
+
+        H, W = self.target_shape
+        num_levels = max(1, int(np.ceil(np.log2(max(H, W) / chunk_size)) + 1))
+        levels = self._build_pyramid_levels(num_levels=num_levels, is_mask=is_mask)
+
+        # Open root group as zarr-format v2 (OME-NGFF v0.4 requirement).
+        store = zarr.storage.LocalStore(str(output_dir))
+        root = zarr.open_group(store=store, mode="w", zarr_format=2)
+
+        datasets: list[dict] = []
+        num_channels = len(self.in_chns)
+        for L, level_imgs in enumerate(levels):
+            stacked = np.stack(level_imgs, axis=0)  # (C, H_L, W_L)
+            arr = root.create_array(
+                name=str(L),
+                shape=stacked.shape,
+                chunks=(num_channels, chunk_size, chunk_size),
+                dtype=stacked.dtype,
+            )
+            arr[:] = stacked
+            scale_xy = float(2 ** L) * (pixel_size if pixel_size is not None else 1.0)
+            datasets.append({
+                "path": str(L),
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, scale_xy, scale_xy]}
+                ],
+            })
+
+        spatial_axis = {"name": "y", "type": "space"}
+        if pixel_size is not None:
+            spatial_axis["unit"] = "micrometer"
+        axes = [
+            {"name": "c", "type": "channel"},
+            {**spatial_axis, "name": "y"},
+            {**spatial_axis, "name": "x"},
+        ]
+
+        root.attrs["multiscales"] = [{
+            "version": "0.4",
+            "name": output_dir.stem,
+            "axes": axes,
+            "datasets": datasets,
+            "type": "nearest" if is_mask else "mean",
+        }]
+        root.attrs["omero"] = {
+            "channels": [{"label": name} for name in self.in_chns],
+        }
+
     def export_ometiff_pyramid(
         self,
         output_f: Union[str, pathlib.Path],
