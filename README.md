@@ -1,6 +1,6 @@
 # pyratiff
 
-Read and write pyramidal OME-TIFF files.
+Read and write pyramidal OME-TIFF and **OME-NGFF (zarr)** files.
 
 ## Installation
 
