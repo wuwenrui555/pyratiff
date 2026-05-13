@@ -290,6 +290,89 @@ def test_export_pixel_values_preserved(tmp_path):
     np.testing.assert_array_equal(result, data)
 
 
+def _expected_downsampled(prev: np.ndarray, is_mask: bool, target_dtype) -> np.ndarray:
+    """Reference 2x downsample, mirrors PyramidWriter's per-tile logic."""
+    import skimage.transform
+    if is_mask:
+        return prev[..., ::2, ::2].astype(target_dtype)
+    if prev.ndim == 2:
+        ds = skimage.transform.downscale_local_mean(prev, (2, 2))
+    else:  # (C, H, W) → downsample H, W only
+        ds = np.stack([
+            skimage.transform.downscale_local_mean(prev[c], (2, 2))
+            for c in range(prev.shape[0])
+        ])
+    if np.issubdtype(target_dtype, np.floating):
+        return ds.astype(target_dtype)
+    return np.round(ds).astype(target_dtype)
+
+
+def test_export_pyramid_level_values_uint16(tmp_path):
+    """Each pyramid level must be the local-mean downsample of the previous one (uint16)."""
+    out = tmp_path / "out.ome.tiff"
+    rng = np.random.default_rng(42)
+    data = rng.integers(0, 1000, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ometiff_pyramid(out, tile_size=128)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    # Build expected pyramid via in-memory cascade.
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=False,
+                                              target_dtype=np.uint16))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mismatch")
+
+
+def test_export_pyramid_level_values_mask(tmp_path):
+    """Mask mode uses nearest-neighbour subsampling."""
+    out = tmp_path / "mask.ome.tiff"
+    rng = np.random.default_rng(7)
+    # 2 channels so tifffile keeps the channel dim on read.
+    data = rng.integers(0, 50, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["labels_a", "labels_b"], is_mask=True)
+    writer.export_ometiff_pyramid(out, tile_size=128, is_mask=True)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=True,
+                                              target_dtype=np.uint16))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mask mismatch")
+
+
+def test_export_pyramid_level_values_float(tmp_path):
+    """Float dtype skips the round() step in downsampling."""
+    out = tmp_path / "out.ome.tiff"
+    rng = np.random.default_rng(13)
+    data = rng.random((2, 512, 512), dtype=np.float32)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ometiff_pyramid(out, tile_size=128)
+
+    with tifffile.TiffFile(str(out)) as tif:
+        n_levels = len(tif.series[0].levels)
+
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=False,
+                                              target_dtype=np.float32))
+
+    for L, exp in enumerate(expected):
+        actual = tifffile.imread(str(out), level=L)
+        np.testing.assert_allclose(actual, exp, rtol=1e-5,
+                                   err_msg=f"level {L} float mismatch")
+
+
 # ---------------------------------------------------------------------------
 # float dtype support
 # ---------------------------------------------------------------------------
@@ -313,3 +396,249 @@ def test_export_float_roundtrip(tmp_path, dtype):
     result = tifffile.imread(str(out), level=0)
     assert result.dtype == np.dtype(dtype)
     np.testing.assert_allclose(result, data, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# export_ome_zarr (OME-NGFF v0.4)
+# ---------------------------------------------------------------------------
+
+import zarr  # noqa: E402
+
+
+def _open_zarr_group(path):
+    return zarr.open_group(store=zarr.storage.LocalStore(str(path)), mode="r")
+
+
+def test_ome_zarr_creates_directory(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    _make_writer().export_ome_zarr(out)
+    assert out.is_dir()
+    assert (out / ".zgroup").exists()
+    assert (out / ".zattrs").exists()
+    assert (out / "0" / ".zarray").exists()
+
+
+def test_ome_zarr_overwrite_false_raises(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    _make_writer().export_ome_zarr(out)
+    with pytest.raises(FileExistsError):
+        _make_writer().export_ome_zarr(out, overwrite=False)
+
+
+def test_ome_zarr_overwrite_true_replaces(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    _make_writer().export_ome_zarr(out)
+    _make_writer().export_ome_zarr(out, overwrite=True)
+    assert out.is_dir()
+
+
+def test_ome_zarr_multiscales_metadata(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    _make_writer(shape=(2, 512, 512), names=["A", "B"]).export_ome_zarr(
+        out, pixel_size=0.325, chunk_size=128
+    )
+    root = _open_zarr_group(out)
+    ms = root.attrs["multiscales"][0]
+    assert ms["version"] == "0.4"
+    assert ms["axes"][0]["name"] == "c"
+    assert ms["axes"][0]["type"] == "channel"
+    assert ms["axes"][1]["name"] == "y"
+    assert ms["axes"][1]["unit"] == "micrometer"
+    assert ms["axes"][2]["name"] == "x"
+    # 512 / 128 = 4 → ceil(log2(4)) + 1 = 3 levels
+    assert len(ms["datasets"]) == 3
+    assert ms["datasets"][0]["path"] == "0"
+    assert ms["datasets"][0]["coordinateTransformations"][0]["scale"] == [1.0, 0.325, 0.325]
+    assert ms["datasets"][1]["coordinateTransformations"][0]["scale"] == [1.0, 0.65, 0.65]
+    assert ms["type"] == "mean"
+
+
+def test_ome_zarr_no_pixel_size_omits_unit(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    _make_writer().export_ome_zarr(out)  # no pixel_size
+    root = _open_zarr_group(out)
+    ms = root.attrs["multiscales"][0]
+    for axis in ms["axes"][1:]:  # spatial axes
+        assert "unit" not in axis
+    # scales are pure 2^L ratios
+    assert ms["datasets"][0]["coordinateTransformations"][0]["scale"] == [1.0, 1.0, 1.0]
+
+
+def test_ome_zarr_omero_channel_names(tmp_path):
+    out = tmp_path / "out.ome.zarr"
+    names = ["DAPI", "CD45", "PanCK"]
+    _make_writer(names=names).export_ome_zarr(out)
+    root = _open_zarr_group(out)
+    omero = root.attrs["omero"]
+    assert [c["label"] for c in omero["channels"]] == names
+
+
+def test_ome_zarr_pyramid_level_values_uint16(tmp_path):
+    """OME-Zarr levels should match the same in-memory cascade as OME-TIFF."""
+    out = tmp_path / "out.ome.zarr"
+    rng = np.random.default_rng(99)
+    data = rng.integers(0, 1000, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["A", "B"])
+    writer.export_ome_zarr(out, chunk_size=128)
+
+    root = _open_zarr_group(out)
+    n_levels = len(root.attrs["multiscales"][0]["datasets"])
+
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=False,
+                                              target_dtype=np.uint16))
+
+    for L, exp in enumerate(expected):
+        actual = np.asarray(root[str(L)][:])
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mismatch")
+
+
+def test_ome_zarr_mask_uses_nearest(tmp_path):
+    out = tmp_path / "mask.ome.zarr"
+    rng = np.random.default_rng(7)
+    data = rng.integers(0, 50, (2, 512, 512), dtype=np.uint16)
+    writer = PyramidWriter.from_array(data, channel_names=["a", "b"], is_mask=True)
+    writer.export_ome_zarr(out, chunk_size=128, is_mask=True)
+
+    root = _open_zarr_group(out)
+    assert root.attrs["multiscales"][0]["type"] == "nearest"
+
+    n_levels = len(root.attrs["multiscales"][0]["datasets"])
+    expected = [data]
+    for _ in range(1, n_levels):
+        expected.append(_expected_downsampled(expected[-1], is_mask=True,
+                                              target_dtype=np.uint16))
+    for L, exp in enumerate(expected):
+        actual = np.asarray(root[str(L)][:])
+        np.testing.assert_array_equal(actual, exp, err_msg=f"level {L} mask mismatch")
+
+
+def test_ome_zarr_and_ometiff_byte_identical(tmp_path):
+    """Both formats hold byte-identical pyramid data (different containers, same numbers)."""
+    rng = np.random.default_rng(123)
+    data = rng.integers(0, 1000, (3, 512, 512), dtype=np.uint16)
+
+    writer_a = PyramidWriter.from_array(data, channel_names=["A", "B", "C"])
+    writer_a.export_ometiff_pyramid(tmp_path / "out.ome.tiff", tile_size=128)
+
+    writer_b = PyramidWriter.from_array(data, channel_names=["A", "B", "C"])
+    writer_b.export_ome_zarr(tmp_path / "out.ome.zarr", chunk_size=128)
+
+    root = _open_zarr_group(tmp_path / "out.ome.zarr")
+    n_levels = len(root.attrs["multiscales"][0]["datasets"])
+    for L in range(n_levels):
+        tiff_level = tifffile.imread(str(tmp_path / "out.ome.tiff"), level=L)
+        zarr_level = np.asarray(root[str(L)][:])
+        np.testing.assert_array_equal(
+            tiff_level, zarr_level, err_msg=f"level {L} differs between formats"
+        )
+
+
+# ---------------------------------------------------------------------------
+# v2.0 — from_ome_zarr constructor + streaming/lazy semantics
+# ---------------------------------------------------------------------------
+
+
+def test_from_ome_zarr_round_trip(tmp_path):
+    """Write OME-Zarr, read it back via from_ome_zarr, re-export — values must match."""
+    rng = np.random.default_rng(2026)
+    data = rng.integers(0, 500, (2, 256, 256), dtype=np.uint16)
+
+    src_path = tmp_path / "src.ome.zarr"
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        src_path, chunk_size=128
+    )
+
+    # Reload and re-export (testing the from_ome_zarr lazy reader).
+    writer = PyramidWriter.from_ome_zarr(src_path)
+    assert writer.in_chns == ["A", "B"]
+    assert writer.target_shape == (256, 256)
+    assert writer.target_dtype == np.dtype("uint16")
+
+    re_path = tmp_path / "re.ome.zarr"
+    writer.export_ome_zarr(re_path, chunk_size=128)
+
+    src_root = _open_zarr_group(src_path)
+    re_root = _open_zarr_group(re_path)
+    np.testing.assert_array_equal(
+        np.asarray(src_root["0"][:]), np.asarray(re_root["0"][:])
+    )
+
+
+def test_from_ome_zarr_falls_back_to_default_channel_names(tmp_path):
+    """OME-Zarr without omero metadata still loads with channel_0..N-1."""
+    # Build a minimal v0.4 zarr without omero metadata.
+    src = tmp_path / "minimal.ome.zarr"
+    store = zarr.storage.LocalStore(str(src))
+    root = zarr.open_group(store=store, mode="w", zarr_format=2)
+    arr = root.create_array(name="0", shape=(2, 64, 64), chunks=(2, 32, 32), dtype=np.uint16)
+    arr[:] = np.zeros((2, 64, 64), dtype=np.uint16)
+    root.attrs["multiscales"] = [{
+        "version": "0.4",
+        "axes": [{"name": "c", "type": "channel"},
+                 {"name": "y", "type": "space"},
+                 {"name": "x", "type": "space"}],
+        "datasets": [{"path": "0",
+                      "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}],
+    }]
+
+    writer = PyramidWriter.from_ome_zarr(src)
+    assert writer.in_chns == ["channel_0", "channel_1"]
+
+
+def test_streaming_does_not_materialize_full_pyramid_in_memory(tmp_path):
+    """Lazy/streaming guard: confirm `in_imgs` items stay zarr-like (not realized to numpy)."""
+    rng = np.random.default_rng(7)
+    src = tmp_path / "src.ome.zarr"
+    data = rng.integers(0, 100, (2, 128, 128), dtype=np.uint16)
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        src, chunk_size=64
+    )
+
+    writer = PyramidWriter.from_ome_zarr(src)
+    # in_imgs entries should be lazy views, not numpy arrays loaded eagerly.
+    for item in writer.in_imgs:
+        assert not isinstance(item, np.ndarray), \
+            "from_ome_zarr should keep input lazy (not materialize as numpy)"
+
+
+def test_streaming_pyramid_byte_identical_across_tile_sizes(tmp_path):
+    """The streaming pyramid produces the same content regardless of tile_size."""
+    rng = np.random.default_rng(31)
+    data = rng.integers(0, 1000, (2, 384, 384), dtype=np.uint16)
+
+    out_a = tmp_path / "a.ome.zarr"
+    out_b = tmp_path / "b.ome.zarr"
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        out_a, chunk_size=128
+    )
+    PyramidWriter.from_array(data, channel_names=["A", "B"]).export_ome_zarr(
+        out_b, chunk_size=64
+    )
+
+    root_a = _open_zarr_group(out_a)
+    root_b = _open_zarr_group(out_b)
+    n_a = len(root_a.attrs["multiscales"][0]["datasets"])
+    n_b = len(root_b.attrs["multiscales"][0]["datasets"])
+    # Different tile_size produces different *level counts*, but level 0 must
+    # be identical (it's just the base image).
+    np.testing.assert_array_equal(
+        np.asarray(root_a["0"][:]), np.asarray(root_b["0"][:])
+    )
+    # Levels that exist in both must agree byte-for-byte.
+    for L in range(min(n_a, n_b)):
+        if str(L) in root_a and str(L) in root_b:
+            np.testing.assert_array_equal(
+                np.asarray(root_a[str(L)][:]),
+                np.asarray(root_b[str(L)][:]),
+                err_msg=f"level {L} differs between tile sizes",
+            )
+
+
+def test_ometiff_temp_zarr_cleaned_up(tmp_path):
+    """After export_ometiff_pyramid, no leftover staging zarr should remain in tmp_path."""
+    out = tmp_path / "out.ome.tiff"
+    _make_writer().export_ometiff_pyramid(out)
+    leftover_zarrs = list(tmp_path.glob("*.ome.zarr"))
+    assert leftover_zarrs == [], f"Found leftover staging zarr: {leftover_zarrs}"
