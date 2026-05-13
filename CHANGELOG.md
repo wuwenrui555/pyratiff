@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.2] - 2026-05-13
+
+### Added
+
+- GitHub Actions CI workflow (`.github/workflows/test.yml`):
+  pytest matrix on Python 3.12 and 3.13, plus a build-check job that
+  verifies the wheel imports cleanly after install.
+
 ## [2.0.1] - 2026-04-26
 
 ### Changed
